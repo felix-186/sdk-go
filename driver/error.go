@@ -30,6 +30,7 @@ func TcpClientErrSuggest(err error) (ErrorType, error) {
 		return CONNECTION_FAIELD, logger.NewErrorFocusNotice("检查服务端设备是否开机；检查网络端口是否连通；检查防火墙端口是否开放", err)
 	} else if strings.Contains(err.Error(), "broken pipe") ||
 		strings.Contains(err.Error(), "use of closed network connection") ||
+		strings.Contains(err.Error(), "no route to host") ||
 		strings.Contains(err.Error(), "connection reset by peer") {
 		return CONNECTION_CLOSED, logger.NewErrorFocusNotice("检查服务端设备是否超过最大连接数限制；检查连接是否空闲超时被断开", err)
 	} else if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
