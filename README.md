@@ -11,9 +11,9 @@ IOT SDK Go 是用于开发 IOT 平台扩展服务的 Go SDK，覆盖 Driver、Al
 - [快速开始](#快速开始)
 - [核心接口](#核心接口)
 - [Driver 配置示例](#driver-配置示例)
-- [Driver 配置变更说明](#driver-配置变更说明)
-- [Driver License 动态库加载](#driver-license-动态库加载)
 - [示例目录](#示例目录)
+- [打包与部署](#打包与部署)
+  - [授权动态库](#授权动态库)
 - [FAQ](#faq)
 - [环境要求](#环境要求)
 - [许可证](#许可证)
@@ -169,41 +169,6 @@ log:
   format: json
 ```
 
-## Driver 配置变更说明
-
-- `driverGrpc.healthRequestTime` 已调整为 `driverGrpc.health.requestTime`。
-- `driverGrpc.waitTime`、`driverGrpc.timeout` 使用时长格式（如 `5s`、`600s`）。
-- `dataFile.enable=true` 时，SDK 会读取 `dataFile.path` 指向的 `data.json` 作为驱动运行配置，并监听文件变化自动重载。
-- 新增 `license` 配置：用于授权目录路径（注意是目录，不是单个文件）。
-
-## Driver License 动态库加载
-
-SDK 会按平台加载 `license_core` 动态库，并调用库函数校验驱动授权。
-
-库名规则：
-
-- Windows amd64: `license_core_windows_amd64.dll`
-- Windows arm64: `license_core_windows_arm64.dll`
-- Linux amd64: `license_core_linux_amd64.so`
-- Linux arm64: `license_core_linux_arm64.so`
-- Linux loong64: `license_core_linux_loong64.so`
-- macOS amd64: `license_core_darwin_amd64.dylib`
-- macOS arm64: `license_core_darwin_arm64.dylib`
-
-查找顺序：
-
-- 当前工作目录
-- `./lib/`
-- `./license/lib/`
-- 可执行文件同目录
-- 可执行文件目录下的 `lib/`
-
-授权兜底行为：
-
-- 当 `license` 为空或路径无效时，会按“无授权模式”校验。
-- 无授权模式下允许的总 tag 上限为 `20`，超过即启动失败。
-- 以下驱动 ID 免授权：`test`、`modbus`、`modbus_rtu`、`db-driver`、`driver-http-client`、`driver-mqtt-client`、`opcda`、`modbus_rtutcp`。
-
 ## 示例目录
 
 - [example/driver](./example/driver)
@@ -215,6 +180,239 @@ SDK 会按平台加载 `license_core` 动态库，并调用库函数校验驱动
 - [example/service](./example/service)
 - [example/task](./example/task)
 
+## 打包与部署
+
+本节介绍使用 Go SDK 开发的 kesi 驱动如何打包并部署到平台。可从 [`example/driver/main.go`](./example/driver/main.go) 开始；发布自己的驱动时，将示例中的 `go-driver-mqtt-demo` 换成实际驱动 ID，并保持程序名、`service.yml` 的 `Name`、`config.yaml` 的 `driver.id` 一致。原生包的 `Command` 还需指向实际可执行文件。
+
+### 先确认目标环境
+
+| 包类型 | 安装包根目录包含 | 如何启动 | 入站端口写在哪里 |
+| --- | --- | --- | --- |
+| Windows ZIP | `service.yml`、`.exe`、`etc/config.yaml` | `service.yml` 的 `Command` 指向 `.exe` | 程序的配置文件 |
+| Linux Docker `.tar.gz` | `service.yml`、Docker 镜像归档 `.tar.gz` | 镜像的 `ENTRYPOINT` | `service.yml` 的 `Service`、`Path`、`Ports` |
+| Linux/macOS binary `.tar.gz` | `service.yml`、可执行文件、`etc/config.yaml` | `service.yml` 的 `Command` 指向可执行文件 | 程序的配置文件 |
+
+这里的 **binary 包**指直接运行可执行文件，**Docker 包**指平台导入并运行镜像。两者虽都以 `.tar.gz` 结尾，包内内容和启动方式不同，不能互换。按平台运行模式和目标 CPU 架构选择安装包。Go 版本至少为 `1.25`。
+
+**平台 gRPC 模式是否需要授权动态库：**只通过 gRPC 接收平台的启动配置时不需要。保持 `dataFile.enable=false`（SDK 默认值），且不调用 SDK 的 HTTP 启动接口。即使已连接 gRPC，只要同时启用本地 `dataFile` 启动或调用 HTTP 启动接口，那条启动路径仍需要动态库。连接方式和安装包类型是两回事：Windows 原生包与 Linux 容器包都可以使用平台 gRPC 模式。
+
+### 通用配置
+
+驱动默认从当前工作目录的 `./etc/config.yaml` 读取配置，也可通过 `--config` 指定配置目录。至少配置 `driver.id`、`driver.name`。本地调试时可通过 `--project`、`--serviceId` 指定实例信息；平台安装并创建实例时由平台注入，发布包无需固定开发环境的实例 ID。
+
+Windows 原生部署的 `etc/config.yaml` 可从以下内容开始，并按实际平台地址调整：
+
+```yaml
+driver:
+  id: go-driver-mqtt-demo
+  name: Go 驱动示例
+driverGrpc:
+  host: 127.0.0.1
+  port: 9224
+mq:
+  type: mqtt
+  mqtt:
+    host: 127.0.0.1
+    port: 1883
+```
+
+Linux 容器环境可参考 [`example/driver/etc/config.docker.yaml`](./example/driver/etc/config.docker.yaml)：只保留驱动身份字段时，SDK 使用容器环境的默认 `driverGrpc.host=driver`、`mq.mqtt.host=mqtt`。如启用 `dataFile.enable`，还需让 `dataFile.path` 指向容器或进程能访问的 `data.json`；默认值为 `false`。
+
+### Windows 原生包
+
+在仓库根目录使用 PowerShell 编译示例。自己的项目需把 `./example/driver` 换为实际 `main` 包路径。
+
+```powershell
+$env:CGO_ENABLED = '0'
+$env:GOOS = 'windows'
+$env:GOARCH = 'amd64'
+go build -tags netgo -o .\go-driver-mqtt-demo.exe ./example/driver
+```
+
+准备 `service.yml`：
+
+```yaml
+Name: go-driver-mqtt-demo
+Version: 1.0.0
+Description: Go 驱动示例
+ConfigType: config.yaml
+GroupName: driver
+Command: go-driver-mqtt-demo.exe
+```
+
+把文件放在 ZIP 根目录，而不是多包一层项目目录：
+
+```text
+go-driver-mqtt-demo-windows-x86_64.zip
+├── service.yml
+├── go-driver-mqtt-demo.exe
+├── etc/
+│   └── config.yaml
+└── lib/                         # 仅本地 dataFile / HTTP 启动模式需要
+    └── license_core_windows_amd64.dll
+```
+
+在项目根目录准备 `stage/` 暂存目录，放入上述文件后执行 `Compress-Archive -Path .\stage\* -DestinationPath .\go-driver-mqtt-demo-windows-x86_64.zip`。自带配置页面、Schema 文件或其他资源的驱动，也需一并放入暂存目录。若发布环境要求 Windows 签名，应在压缩前完成。
+
+### Linux 容器包
+
+以下以 Linux amd64 为例，命令在项目根目录的 Bash 环境执行。arm64 将 `GOARCH` 改为 `arm64`、`--platform` 改为 `linux/arm64`，并使用对应架构的基础镜像；若选用需要授权动态库的启动路径，动态库架构也须匹配。loong64 需在支持该架构的构建环境编译。
+
+```bash
+mkdir -p build/driver-image/etc build/driver-package
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags netgo -o build/driver-image/go-driver-mqtt-demo ./example/driver
+cp example/driver/etc/config.docker.yaml build/driver-image/etc/config.yaml
+```
+
+在 `build/driver-image/Dockerfile` 中放入：
+
+```dockerfile
+FROM debian:bookworm-slim
+WORKDIR /app
+COPY go-driver-mqtt-demo /app/go-driver-mqtt-demo
+COPY etc/config.yaml /app/etc/config.yaml
+ENTRYPOINT ["/app/go-driver-mqtt-demo"]
+```
+
+上述镜像用于平台 gRPC 启动模式，不需要授权动态库。若还启用 `dataFile` 本地启动或 SDK 的 HTTP 启动接口，构建前须把匹配目标架构和镜像运行时的 `license_core_linux_amd64.so` 放到 `build/driver-image/lib/`，并在 Dockerfile 中加上 `COPY lib/license_core_linux_amd64.so /app/lib/`。此处采用 Debian 基础镜像，需确认动态库及其依赖与镜像中的 libc 兼容。随后执行：
+
+```bash
+docker build --platform linux/amd64 -t gtsiot/go-driver-mqtt-demo:v1.0.0 build/driver-image
+docker save -o build/driver-package/go-driver-mqtt-demo.tar gtsiot/go-driver-mqtt-demo:v1.0.0
+gzip build/driver-package/go-driver-mqtt-demo.tar
+```
+
+在 `build/driver-package/service.yml` 中放入：
+
+```yaml
+Name: go-driver-mqtt-demo
+Version: 1.0.0
+Description: Go 驱动示例
+GroupName: driver
+Service: None
+```
+
+`Service` 可取 `None`、`Internal`、`External`。驱动只主动连接平台或设备、没有入站服务时使用 `None`。驱动提供 HTTP 接口供平台内部访问时，填写 `Internal`、访问路径 `Path` 和 `Ports`。例如驱动的 `config.yaml` 设置 `http.enable: true`、`http.port: 8080`，安装配置可写为：
+
+```yaml
+Name: go-driver-mqtt-demo
+Version: 1.0.0
+GroupName: driver
+Service: Internal
+Path: /go-driver-mqtt-demo
+Ports:
+  - Host: "8080"
+    Container: "8080"
+    Protocol: ""
+    AppProtocol: http
+```
+
+需要把端口发布到宿主机时使用 `External`。以下示例在提供上述 HTTP 接口的同时，向宿主机发布驱动监听的 TCP `8558` 端口：
+
+```yaml
+Name: go-driver-mqtt-demo
+Version: 1.0.0
+GroupName: driver
+Service: External
+Path: /go-driver-mqtt-demo
+Ports:
+  - Host: "18080"
+    Container: "8080"
+    Protocol: ""
+    AppProtocol: http
+  - Host: "8558"
+    Container: "8558"
+    Protocol: ""
+```
+
+`Container` 是程序在容器内实际监听的端口；`Host` 是选择 `External` 时发布到宿主机的端口，两个端口可以不同。选择 `Internal` 时仍按上述格式填写 `Host`，平台不会将其发布到宿主机。`Protocol` 留空按 TCP 处理，UDP 端口填写 `udp`。有多个端口时，用 `AppProtocol: http` 标明用于 HTTP 路由的端口，避免把设备通信端口选为 HTTP 端口。`Path` 是平台转发 HTTP 请求的路径前缀。选择 `Internal` 或 `External` 时必须填写 `Ports`；容器内的监听端口还要与 `config.yaml` 一致。这里的 `Ports` 用于 Linux 容器包；SDK 用 `driverGrpc.host`、`driverGrpc.port` **主动连接**平台，这组连接参数不是需要发布的入站端口。
+
+最后从**内层包目录**打包，确保外层归档根目录直接包含 `service.yml` 和镜像归档：
+
+```bash
+tar -C build/driver-package -czf go-driver-mqtt-demo-linux-x86_64.tar.gz service.yml go-driver-mqtt-demo.tar.gz
+tar -tzf go-driver-mqtt-demo-linux-x86_64.tar.gz
+```
+
+上传到平台的是外层 `go-driver-mqtt-demo-linux-x86_64.tar.gz` 安装包；内层 `go-driver-mqtt-demo.tar.gz` 是 `docker save` 的镜像。安装包根目录需有 `service.yml` 和镜像文件，不能只上传内层镜像。
+
+### Linux/macOS 原生包
+
+仅在平台以原生进程运行驱动时使用。Linux amd64 示例先编译可执行文件：
+
+```bash
+mkdir -p build/driver-binary/etc
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags netgo -o build/driver-binary/go-driver-mqtt-demo ./example/driver
+```
+
+压缩前的目录结构：
+
+```text
+build/driver-binary/
+├── service.yml
+├── go-driver-mqtt-demo
+├── etc/
+│   └── config.yaml
+└── lib/                         # 仅本地 dataFile / HTTP 启动模式需要
+    └── license_core_linux_amd64.so
+```
+
+`service.yml` 与 Windows 版类似，但 `Command: go-driver-mqtt-demo`。`config.yaml` 使用目标环境的配置，不要原样发布示例中的开发用 `serviceId`、`project` 和平台地址。准备好上述文件后，从目录内生成归档：
+
+```bash
+tar -C build/driver-binary -czf go-driver-mqtt-demo-linux-x86_64-binary.tar.gz service.yml go-driver-mqtt-demo etc
+```
+
+`-C build/driver-binary` 只切换目录；后面的三个路径指定要打包的文件。归档根目录不会包含 `build/driver-binary` 这层目录。
+
+需要 `lib/` 时，在命令末尾再加入 `lib`。macOS 使用 `GOOS=darwin`、相应 `GOARCH` 和 `.dylib`，并采用 `darwin-...-binary.tar.gz` 命名。原生包与容器包的安装入口由平台运行模式决定。
+
+### 授权动态库
+
+平台通过 gRPC 下发启动配置时，SDK 直接调用 `Driver.Start`，**不调用授权动态库**；只使用这一模式的包无需附带动态库。启用 `dataFile.enable=true` 并从本地 `data.json` 启动，或通过 SDK 的 HTTP 启动接口时，SDK 会在调用 `Driver.Start` 前通过 `license_core` 动态库校验。`license` 配置项是授权目录路径。
+
+| 目标 | 默认库名 |
+| --- | --- |
+| Windows amd64 / arm64 | `license_core_windows_amd64.dll` / `license_core_windows_arm64.dll` |
+| Linux amd64 / arm64 / loong64 | `license_core_linux_amd64.so` / `license_core_linux_arm64.so` / `license_core_linux_loong64.so` |
+| macOS amd64 / arm64 | `license_core_darwin_amd64.dylib` / `license_core_darwin_arm64.dylib` |
+
+需要动态库的模式，建议将其放在可执行文件旁的 `lib/` 目录；Linux/macOS 代码也搜索当前工作目录、`gtsiot/lib/driver/` 及可执行文件目录下的对应位置，Windows 还搜索 `license/lib/`。**这些模式没有动态库时，校验会报 `load driver license library failed`，驱动的 `Start` 不会成功**。如果 `dataFile.enable=true`，进程仍可能保持运行并打印错误，不能仅凭进程存在判断驱动已启动。
+
+#### 下载与打包
+
+使用本地 `dataFile` 或 SDK HTTP 启动接口时，按目标操作系统和 CPU 架构下载对应动态库：
+
+| 目标平台 | 动态库下载地址 |
+| --- | --- |
+| Windows amd64 | `https://d.gtsiot.cn/driverjs/licenselib/license_core_windows_amd64.dll` |
+| Linux amd64 | `https://d.gtsiot.cn/driverjs/licenselib/license_core_linux_amd64.so` |
+| Linux arm64 | `https://d.gtsiot.cn/driverjs/licenselib/license_core_linux_arm64.so` |
+| macOS arm64 | `https://d.gtsiot.cn/driverjs/licenselib/license_core_darwin_arm64.dylib` |
+
+将动态库放入驱动项目的 `lib/` 目录。例如 Windows amd64 在项目根目录执行：
+
+```powershell
+New-Item -ItemType Directory -Force .\lib | Out-Null
+Invoke-WebRequest 'https://d.gtsiot.cn/driverjs/licenselib/license_core_windows_amd64.dll' -OutFile '.\lib\license_core_windows_amd64.dll'
+```
+
+Linux amd64：
+
+```bash
+mkdir -p lib
+curl -fL --retry 3 -o lib/license_core_linux_amd64.so https://d.gtsiot.cn/driverjs/licenselib/license_core_linux_amd64.so
+```
+
+下载后确认文件存在，再将 `lib/` 连同可执行文件放入原生安装包；容器包则按上文 Dockerfile 的可选 `COPY` 步骤放入镜像。需要上表未列出的 Windows arm64、Linux loong64、macOS amd64 动态库时，请联系平台交付方获取。只使用平台 gRPC 启动流时，跳过本节下载步骤。
+
+### 安装与核验
+
+1. 在运维管理系统的服务管理中选择对应平台的离线上传驱动入口，上传**外层** ZIP 或 `tar.gz` 包；界面位置随平台版本变化。也可按本环境的发布流程将包放入离线仓库后安装。
+2. 确认 `service.yml` 的 `GroupName: driver`、`Name`、`Version` 和包内文件完整。Linux 容器包的 `service.yml` 必须位于归档根目录；Windows ZIP 同样建议直接放在根目录。
+3. 查看运维服务的安装日志和驱动运行日志，确认镜像导入或进程启动成功，再在项目里创建驱动实例并检查连接、配置下发与数据上报。
+4. 若安装失败，先检查包格式与架构、`service.yml` 的 `Command` 或 `Service`/`Ports`、配置文件路径。使用本地 `dataFile` 或 HTTP 启动路径时，再检查授权动态库是否存在及其依赖是否与运行环境兼容。
+
 ## FAQ
 
 ### 为什么 `healthRequestTime` 不生效？
@@ -224,9 +422,9 @@ SDK 会按平台加载 `license_core` 动态库，并调用库函数校验驱动
 - `driverGrpc.health.requestTime`
 - `driverGrpc.health.retry`
 
-### `license` 应该填什么？
+### 什么时候需要授权动态库？
 
-填写授权目录路径（目录内由授权库读取所需文件）。如果留空或路径无效，会进入无授权兜底校验。
+仅使用平台 gRPC 启动流时不需要。使用本地 `dataFile` 或 SDK HTTP 启动接口时，需要匹配目标平台的 `license_core` 动态库；获取方式及部署位置见[授权动态库](#授权动态库)。
 
 ### `dataFile` 有什么作用？
 
@@ -234,7 +432,7 @@ SDK 会按平台加载 `license_core` 动态库，并调用库函数校验驱动
 
 ## 环境要求
 
-- Go `>= 1.23`
+- Go `>= 1.25`（以 `go.mod` 的 `go 1.25.0` 为准）
 
 ## 许可证
 

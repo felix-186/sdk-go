@@ -11,9 +11,9 @@ IOT SDK Go is the Go SDK for building IOT extension services, including Driver, 
 - [Quick Start](#quick-start)
 - [Core Interfaces](#core-interfaces)
 - [Driver Configuration Example](#driver-configuration-example)
-- [Driver Config Changes](#driver-config-changes)
-- [Driver License Dynamic Library Loading](#driver-license-dynamic-library-loading)
 - [Example Projects](#example-projects)
+- [Packaging and Deployment](#packaging-and-deployment)
+  - [License Library](#license-library)
 - [FAQ](#faq)
 - [Requirements](#requirements)
 - [License](#license)
@@ -169,41 +169,6 @@ log:
   format: json
 ```
 
-## Driver Config Changes
-
-- `driverGrpc.healthRequestTime` has been replaced by `driverGrpc.health.requestTime`.
-- `driverGrpc.waitTime` and `driverGrpc.timeout` use duration format (for example `5s`, `600s`).
-- When `dataFile.enable=true`, SDK reads driver runtime config from `dataFile.path` (`data.json`) and hot-reloads it on file change.
-- Added `license` config: this must be a directory path (not a single file path).
-
-## Driver License Dynamic Library Loading
-
-The SDK loads platform-specific `license_core` libraries and verifies driver license through library symbols.
-
-Library names:
-
-- Windows amd64: `license_core_windows_amd64.dll`
-- Windows arm64: `license_core_windows_arm64.dll`
-- Linux amd64: `license_core_linux_amd64.so`
-- Linux arm64: `license_core_linux_arm64.so`
-- Linux loong64: `license_core_linux_loong64.so`
-- macOS amd64: `license_core_darwin_amd64.dylib`
-- macOS arm64: `license_core_darwin_arm64.dylib`
-
-Lookup order:
-
-- current working directory
-- `./lib/`
-- `./license/lib/`
-- executable directory
-- `lib/` under executable directory
-
-Fallback behavior:
-
-- If `license` is empty or invalid, SDK switches to "no-license fallback" validation.
-- In fallback mode, max total tag count is `20`; startup fails if exceeded.
-- These driver IDs are exempt from license verification: `test`, `modbus`, `modbus_rtu`, `db-driver`, `driver-http-client`, `driver-mqtt-client`, `opcda`, `modbus_rtutcp`.
-
 ## Example Projects
 
 - [example/driver](./example/driver)
@@ -215,6 +180,237 @@ Fallback behavior:
 - [example/service](./example/service)
 - [example/task](./example/task)
 
+## Packaging and Deployment
+
+This section shows how to package a kesi driver built with the Go SDK. You can start from [`example/driver/main.go`](./example/driver/main.go). Replace `go-driver-mqtt-demo` with your own driver ID, and keep the program name, `service.yml`'s `Name`, and `config.yaml`'s `driver.id` consistent. For native packages, `Command` must name the actual executable.
+
+### Choose the Target Package
+
+| Package | Files at the archive root | Startup | Incoming port configuration |
+| --- | --- | --- | --- |
+| Windows ZIP | `service.yml`, `.exe`, `etc/config.yaml` | `Command` in `service.yml` names the `.exe` | Application config |
+| Linux Docker `.tar.gz` | `service.yml`, Docker image archive `.tar.gz` | Image `ENTRYPOINT` | `Service`, `Path`, and `Ports` in `service.yml` |
+| Linux/macOS binary `.tar.gz` | `service.yml`, executable, `etc/config.yaml` | `Command` in `service.yml` names the executable | Application config |
+
+A **binary package** runs an executable directly. A **Docker package** imports and runs an image. Both Linux package types use `.tar.gz`, but their contents and startup methods differ. Choose the package matching the platform's runtime and CPU architecture. Go 1.25 or later is required.
+
+**License library in platform gRPC mode:** You do not need it when the driver only receives its start configuration through platform gRPC. Keep `dataFile.enable=false` (the SDK default) and do not call the SDK HTTP start endpoint. If you also use local `dataFile` startup or the HTTP start endpoint, that startup path still requires the library. Windows, Docker, and binary packaging can each use the platform gRPC mode.
+
+### Common Configuration
+
+By default, the driver reads `./etc/config.yaml` relative to its working directory. Use `--config` to specify another config directory. Set at least `driver.id` and `driver.name`. For local development, `--project` and `--serviceId` can select an instance; do not hard-code development instance IDs into a release package.
+
+For a native Windows deployment, start with this `etc/config.yaml` and adjust the platform addresses:
+
+```yaml
+driver:
+  id: go-driver-mqtt-demo
+  name: Go Driver Example
+driverGrpc:
+  host: 127.0.0.1
+  port: 9224
+mq:
+  type: mqtt
+  mqtt:
+    host: 127.0.0.1
+    port: 1883
+```
+
+For Linux containers, see [`example/driver/etc/config.docker.yaml`](./example/driver/etc/config.docker.yaml). With only the driver identity fields set, the SDK defaults to `driverGrpc.host=driver` and `mq.mqtt.host=mqtt`. If you enable `dataFile`, set its path to a `data.json` file accessible to the process. `dataFile.enable` defaults to `false`.
+
+### Windows Native Package
+
+Build the example from the repository root in PowerShell. Replace `./example/driver` with your own `main` package path:
+
+```powershell
+$env:CGO_ENABLED = '0'
+$env:GOOS = 'windows'
+$env:GOARCH = 'amd64'
+go build -tags netgo -o .\go-driver-mqtt-demo.exe ./example/driver
+```
+
+Create `service.yml`:
+
+```yaml
+Name: go-driver-mqtt-demo
+Version: 1.0.0
+Description: Go driver example
+ConfigType: config.yaml
+GroupName: driver
+Command: go-driver-mqtt-demo.exe
+```
+
+Place the files at the ZIP root, without an extra project directory:
+
+```text
+go-driver-mqtt-demo-windows-x86_64.zip
+├── service.yml
+├── go-driver-mqtt-demo.exe
+├── etc/
+│   └── config.yaml
+└── lib/                         # Only for local dataFile / HTTP startup
+    └── license_core_windows_amd64.dll
+```
+
+Prepare `stage/` at the project root with those files, then run `Compress-Archive -Path .\stage\* -DestinationPath .\go-driver-mqtt-demo-windows-x86_64.zip` from the project root. Include any configuration page, schema, or other resources your driver uses. Complete Windows signing before compression if your release environment requires it.
+
+### Linux Docker Package
+
+The commands below build Linux amd64 from the project root in Bash. For arm64, use `GOARCH=arm64`, `--platform linux/arm64`, and an arm64 base image. Any required license library must also match the target architecture. Build loong64 in a compatible environment.
+
+```bash
+mkdir -p build/driver-image/etc build/driver-package
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags netgo -o build/driver-image/go-driver-mqtt-demo ./example/driver
+cp example/driver/etc/config.docker.yaml build/driver-image/etc/config.yaml
+```
+
+Create `build/driver-image/Dockerfile`:
+
+```dockerfile
+FROM debian:bookworm-slim
+WORKDIR /app
+COPY go-driver-mqtt-demo /app/go-driver-mqtt-demo
+COPY etc/config.yaml /app/etc/config.yaml
+ENTRYPOINT ["/app/go-driver-mqtt-demo"]
+```
+
+This image uses platform gRPC startup and does not need a license library. If you also use local `dataFile` startup or the SDK HTTP start endpoint, place the matching `license_core_linux_amd64.so` in `build/driver-image/lib/` and add `COPY lib/license_core_linux_amd64.so /app/lib/` to the Dockerfile. Confirm that the library and its dependencies are compatible with the image's libc.
+
+```bash
+docker build --platform linux/amd64 -t gtsiot/go-driver-mqtt-demo:v1.0.0 build/driver-image
+docker save -o build/driver-package/go-driver-mqtt-demo.tar gtsiot/go-driver-mqtt-demo:v1.0.0
+gzip build/driver-package/go-driver-mqtt-demo.tar
+```
+
+For a driver without an incoming service, create `build/driver-package/service.yml`:
+
+```yaml
+Name: go-driver-mqtt-demo
+Version: 1.0.0
+Description: Go driver example
+GroupName: driver
+Service: None
+```
+
+Use `Service: Internal` when the platform should reach a driver HTTP endpoint without publishing its port on the host. For example, with `http.enable: true` and `http.port: 8080` in `config.yaml`:
+
+```yaml
+Name: go-driver-mqtt-demo
+Version: 1.0.0
+GroupName: driver
+Service: Internal
+Path: /go-driver-mqtt-demo
+Ports:
+  - Host: "8080"
+    Container: "8080"
+    Protocol: ""
+    AppProtocol: http
+```
+
+Use `Service: External` to publish ports on the host. This example exposes HTTP on host port 18080 and a device TCP listener on port 8558:
+
+```yaml
+Name: go-driver-mqtt-demo
+Version: 1.0.0
+GroupName: driver
+Service: External
+Path: /go-driver-mqtt-demo
+Ports:
+  - Host: "18080"
+    Container: "8080"
+    Protocol: ""
+    AppProtocol: http
+  - Host: "8558"
+    Container: "8558"
+    Protocol: ""
+```
+
+`Container` is the port the process listens on inside the container. With `External`, `Host` is the published host port and may differ from `Container`. With `Internal`, fill in `Host` as shown, but the platform does not publish it on the host. An empty `Protocol` means TCP; use `udp` for UDP. For multiple ports, mark the HTTP route with `AppProtocol: http` so a device port is not selected as the HTTP port. `Path` is the HTTP routing prefix. `Internal` and `External` require `Ports`, and the container port must match `config.yaml`. These `Ports` belong to the Linux Docker package. The SDK's `driverGrpc.host` and `driverGrpc.port` configure an **outbound** connection to the platform; they are not incoming ports to publish.
+
+The outer archive must have `service.yml` and the compressed image archive directly at its root:
+
+```bash
+tar -C build/driver-package -czf go-driver-mqtt-demo-linux-x86_64.tar.gz service.yml go-driver-mqtt-demo.tar.gz
+tar -tzf go-driver-mqtt-demo-linux-x86_64.tar.gz
+```
+
+Upload the outer `go-driver-mqtt-demo-linux-x86_64.tar.gz`. The inner `go-driver-mqtt-demo.tar.gz` is the image produced by `docker save`; do not upload it alone.
+
+### Linux/macOS Binary Package
+
+Use this package only when the platform runs the driver as a native process. For Linux amd64, build the executable:
+
+```bash
+mkdir -p build/driver-binary/etc
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags netgo -o build/driver-binary/go-driver-mqtt-demo ./example/driver
+```
+
+Prepare this directory before compression:
+
+```text
+build/driver-binary/
+├── service.yml
+├── go-driver-mqtt-demo
+├── etc/
+│   └── config.yaml
+└── lib/                         # Only for local dataFile / HTTP startup
+    └── license_core_linux_amd64.so
+```
+
+The `service.yml` fields are similar to the Windows package, with `Command: go-driver-mqtt-demo`. Use target environment values in `config.yaml`; do not ship development `serviceId`, `project`, or platform addresses. Package the files at the archive root:
+
+```bash
+tar -C build/driver-binary -czf go-driver-mqtt-demo-linux-x86_64-binary.tar.gz service.yml go-driver-mqtt-demo etc
+```
+
+`-C` only changes directories; the three following paths select archive contents. Add `lib` at the end when the library is needed. For macOS, use `GOOS=darwin`, the appropriate `GOARCH`, a `.dylib`, and a `darwin-...-binary.tar.gz` package name.
+
+### License Library
+
+When the platform sends start configuration over gRPC, the SDK calls `Driver.Start` directly and does **not** load the license library. Local startup with `dataFile.enable=true` and the SDK HTTP start endpoint load `license_core` before calling `Driver.Start`. The `license` setting is a license directory path.
+
+| Target | Library name |
+| --- | --- |
+| Windows amd64 / arm64 | `license_core_windows_amd64.dll` / `license_core_windows_arm64.dll` |
+| Linux amd64 / arm64 / loong64 | `license_core_linux_amd64.so` / `license_core_linux_arm64.so` / `license_core_linux_loong64.so` |
+| macOS amd64 / arm64 | `license_core_darwin_amd64.dylib` / `license_core_darwin_arm64.dylib` |
+
+For startup modes that require it, place the library in `lib/` next to the executable. On Linux/macOS, the SDK also searches the working directory, `gtsiot/lib/driver/`, and corresponding locations near the executable. On Windows it also searches `license/lib/`. Without a loadable library, these startup paths report `load driver license library failed` and do not successfully call `Driver.Start`. With `dataFile.enable=true`, the process may remain running after logging the error, so a running process alone does not prove the driver started.
+
+#### Download and Package the Library
+
+For local `dataFile` or SDK HTTP startup, download the library matching the target operating system and CPU architecture:
+
+| Target | Download URL |
+| --- | --- |
+| Windows amd64 | `https://d.gtsiot.cn/driverjs/licenselib/license_core_windows_amd64.dll` |
+| Linux amd64 | `https://d.gtsiot.cn/driverjs/licenselib/license_core_linux_amd64.so` |
+| Linux arm64 | `https://d.gtsiot.cn/driverjs/licenselib/license_core_linux_arm64.so` |
+| macOS arm64 | `https://d.gtsiot.cn/driverjs/licenselib/license_core_darwin_arm64.dylib` |
+
+Put the downloaded file in the driver's `lib/` directory. On Windows amd64, run this from the project root:
+
+```powershell
+New-Item -ItemType Directory -Force .\lib | Out-Null
+Invoke-WebRequest 'https://d.gtsiot.cn/driverjs/licenselib/license_core_windows_amd64.dll' -OutFile '.\lib\license_core_windows_amd64.dll'
+```
+
+On Linux amd64:
+
+```bash
+mkdir -p lib
+curl -fL --retry 3 -o lib/license_core_linux_amd64.so https://d.gtsiot.cn/driverjs/licenselib/license_core_linux_amd64.so
+```
+
+Verify the file exists, then include `lib/` in a native package or add the optional Dockerfile `COPY` step above. Contact your platform provider for targets not listed in the download table, such as Windows arm64, Linux loong64, and macOS amd64. Skip the download when using only the platform gRPC start flow.
+
+### Install and Verify
+
+1. In the operations UI, open service management and upload the **outer** ZIP or `.tar.gz` driver package for the target platform. The location of the upload action may vary by platform version.
+2. Check `GroupName: driver`, `Name`, `Version`, and the package contents. Place `service.yml` at the archive root.
+3. Check installation and driver logs, then create a driver instance and verify connection, configuration delivery, and data reporting.
+4. If installation fails, check the package type and architecture, `Command` or `Service`/`Ports`, and config paths. For local `dataFile` or HTTP startup, also check that the license library and its dependencies are available.
+
 ## FAQ
 
 ### Why is `healthRequestTime` not working?
@@ -224,9 +420,9 @@ Use nested keys:
 - `driverGrpc.health.requestTime`
 - `driverGrpc.health.retry`
 
-### What should `license` point to?
+### When is the license library required?
 
-A license directory path (the native library reads files from that directory). If empty/invalid, no-license fallback is used.
+The platform gRPC start flow does not need the library. Local `dataFile` startup and the SDK HTTP start endpoint require a `license_core` library for the target platform. See [License Library](#license-library) for download and packaging instructions.
 
 ### What is `dataFile` used for?
 
@@ -234,7 +430,7 @@ Local driver runtime config loading and hot reload of `data.json`.
 
 ## Requirements
 
-- Go `>= 1.23`
+- Go `>= 1.25` (as specified by `go.mod`)
 
 ## License
 
