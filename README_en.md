@@ -10,6 +10,7 @@ IOT SDK Go is the Go SDK for building IOT extension services, including Driver, 
 - [Install](#install)
 - [Quick Start](#quick-start)
 - [Core Interfaces](#core-interfaces)
+- [Developing and Deploying Modules](#developing-and-deploying-modules)
 - [Driver Configuration Example](#driver-configuration-example)
 - [Example Projects](#example-projects)
 - [Packaging and Deployment](#packaging-and-deployment)
@@ -119,6 +120,87 @@ type Extension interface {
 ```
 
 Note: historical package name is `flow_extionsion`, so alias import is recommended.
+
+### Service
+
+```go
+type Service interface {
+	Start(App) error
+	Stop(App) error
+}
+```
+
+Register Gin routes through `app.GetHttpServer()` in `Start`; use `Stop` to clean up resources before shutdown.
+
+### Task
+
+```go
+type Task interface {
+	Start(App) error
+	Stop(App) error
+}
+```
+
+Register scheduled jobs through `app.GetCron()` in `Start`. The SDK starts the scheduler and calls `Stop` during shutdown.
+
+## Developing and Deploying Modules
+
+Each module starts with `NewApp().Start(implementation)`. Choose a module based on how the platform invokes it and whether the process needs an incoming port:
+
+| Module | Starting point | Main configuration | Runtime behavior |
+| --- | --- | --- | --- |
+| Driver | [Driver example](./example/driver/main.go) | `driver.id`, `driver.name`, `driverGrpc.host/port` | Connects devices and the platform driver gRPC service; packaging steps follow below |
+| Algorithm | [Algorithm example](./example/algorithm/main.go) | `algorithm.id/name`, `algorithmGrpc.host/port` | Implements `Schema`, `Start`, `Run`, `Stop`; connects to the platform algorithm gRPC service |
+| DataRelay | [Data relay example](./example/data_relay/main.go) | `service.id/name`, `dataRelayGrpc.host/port` | Implements `Start`, `HttpProxy`; connects to the platform data relay gRPC service |
+| Flow | [Flow node example](./example/flow/main.go) | `flow.name`, `flow.mode`, `flowEngine.host/port` | Implements `Handler`, `Debug`; the flow engine invokes its node logic |
+| FlowExtension | [Flow extension example](./example/flow_extension/main.go) | `extension.id/name`, `flowEngine.host/port` | Implements `Schema`, `Run` to provide a configurable node to the flow engine |
+| Service | [HTTP service example](./example/service/main.go) | `server.port` | Implements `Start`, `Stop` and listens on an HTTP port |
+| Task | [Scheduled task example](./example/task/main.go) | Application settings such as `log` | Implements `Start`, `Stop` and runs Cron jobs; no incoming port by default |
+
+The Algorithm, DataRelay, Flow, and FlowExtension examples read `./etc/config.yaml` by default; use `--config` to select another config directory. Their gRPC `host/port` settings are **outbound** platform addresses, not listening ports. In a container, set them to platform service addresses reachable from that container.
+
+The Service and Task examples read `./etc/config.yaml` from the working directory and do not accept `--config`. Running them from the repository root, as shown above, uses SDK defaults. To load an example's config, change into `example/service` or `example/task` and run `go run .`. Service listens on `server.port`; Task has no listening port by default.
+
+For platform deployment, package `service.yml`, the executable or Docker image, and any required `etc/config.yaml` for the target runtime. Use `GroupName: driver` for drivers and `GroupName: dataRelay` for data relays. Use `GroupName: server` when installing Algorithm, Flow, FlowExtension, HTTP Service, or Task as a regular service. Set `Name` to the installation package's service identifier and point `Command` to the executable in a native package. In a container package, `Service: None` means there is no incoming service. For an incoming HTTP endpoint, use `Internal` or `External` with `Path` and `Ports`. Native packages use different port fields.
+
+For example, with HTTP Service configured as `server.port: 9000`, a native Windows `service.yml` can contain:
+
+```yaml
+Name: go-http-demo
+Version: 1.0.0
+GroupName: server
+ConfigType: config.yaml
+Command: go-http-demo.exe
+Path: /go-http-demo
+Port: 9000
+```
+
+For a Linux container package, use this port configuration and set `server.port: 9000` in the image's `etc/config.yaml`:
+
+```yaml
+Name: go-http-demo
+Version: 1.0.0
+GroupName: server
+Service: Internal
+Path: /go-http-demo
+Ports:
+  - Host: "9000"
+    Container: "9000"
+    Protocol: ""
+    AppProtocol: http
+```
+
+`Internal` makes the endpoint available within the platform. To publish it on the host, use `External` and set `Host` to the host port. Task and other modules that only connect outward need no `Path` or port fields. The build commands and file layouts below use a driver as the example; replace the entry point, configuration, and service group for other modules. The license library guidance applies only to the relevant driver startup paths.
+
+The installation sequence depends on the module:
+
+| Module | Publish and install |
+| --- | --- |
+| Driver | First use **offline driver upload** in operations management to add the package to the driver repository. Then select the driver in a project and install or create a driver instance. Use `GroupName: driver`. |
+| DataRelay | First use **offline data relay upload** to add the package to the data relay repository. Then install the data relay service for the target project or instance. Use `GroupName: dataRelay`. |
+| Algorithm, Flow, FlowExtension, Service, Task | Use the platform's regular service installation entry. Use `GroupName: server` when installing as a regular service. |
+
+Uploading a Driver or DataRelay package only adds it to its repository; the later installation step creates the running instance. UI names and locations may vary by platform version.
 
 ## Driver Configuration Example
 
@@ -406,9 +488,9 @@ Verify the file exists, then include `lib/` in a native package or add the optio
 
 ### Install and Verify
 
-1. In the operations UI, open service management and upload the **outer** ZIP or `.tar.gz` driver package for the target platform. The location of the upload action may vary by platform version.
+1. In the operations UI, use **offline driver upload** to add the **outer** ZIP or `.tar.gz` package to the driver repository. The upload action may move between platform versions. You may also use your environment's offline repository publishing process.
 2. Check `GroupName: driver`, `Name`, `Version`, and the package contents. Place `service.yml` at the archive root.
-3. Check installation and driver logs, then create a driver instance and verify connection, configuration delivery, and data reporting.
+3. Select the uploaded driver in a project and install or create a driver instance. Check installation and driver logs to confirm image import or process startup, then verify connection, configuration delivery, and data reporting.
 4. If installation fails, check the package type and architecture, `Command` or `Service`/`Ports`, and config paths. For local `dataFile` or HTTP startup, also check that the license library and its dependencies are available.
 
 ## FAQ

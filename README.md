@@ -10,6 +10,7 @@ IOT SDK Go 是用于开发 IOT 平台扩展服务的 Go SDK，覆盖 Driver、Al
 - [安装](#安装)
 - [快速开始](#快速开始)
 - [核心接口](#核心接口)
+- [各模块开发与部署](#各模块开发与部署)
 - [Driver 配置示例](#driver-配置示例)
 - [示例目录](#示例目录)
 - [打包与部署](#打包与部署)
@@ -119,6 +120,87 @@ type Extension interface {
 ```
 
 说明：`flow_extension` 历史包名为 `flow_extionsion`，建议使用别名导入。
+
+### Service
+
+```go
+type Service interface {
+	Start(App) error
+	Stop(App) error
+}
+```
+
+在 `Start` 中通过 `app.GetHttpServer()` 注册 Gin 路由；`Stop` 用于退出前清理资源。
+
+### Task
+
+```go
+type Task interface {
+	Start(App) error
+	Stop(App) error
+}
+```
+
+在 `Start` 中通过 `app.GetCron()` 注册定时任务；SDK 启动调度器，并在退出时调用 `Stop`。
+
+## 各模块开发与部署
+
+各模块均以 `NewApp().Start(实现对象)` 启动。选择模块时，先确定平台如何调用它，以及程序是否需要监听入站端口：
+
+| 模块 | 开发入口 | 主要配置 | 运行方式 |
+| --- | --- | --- | --- |
+| Driver | [设备驱动示例](./example/driver/main.go) | `driver.id`、`driver.name`、`driverGrpc.host/port` | 接入设备，连接平台驱动 gRPC 服务；打包步骤见下文 |
+| Algorithm | [算法示例](./example/algorithm/main.go) | `algorithm.id/name`、`algorithmGrpc.host/port` | 实现 `Schema`、`Start`、`Run`、`Stop`，连接平台算法 gRPC 服务 |
+| DataRelay | [数据中继示例](./example/data_relay/main.go) | `service.id/name`、`dataRelayGrpc.host/port` | 实现 `Start`、`HttpProxy`，连接平台数据中继 gRPC 服务 |
+| Flow | [流程节点示例](./example/flow/main.go) | `flow.name`、`flow.mode`、`flowEngine.host/port` | 实现 `Handler`、`Debug`，由流程引擎调用节点逻辑 |
+| FlowExtension | [流程扩展示例](./example/flow_extension/main.go) | `extension.id/name`、`flowEngine.host/port` | 实现 `Schema`、`Run`，向流程引擎提供可配置的扩展节点 |
+| Service | [HTTP 服务示例](./example/service/main.go) | `server.port` | 实现 `Start`、`Stop`，自行监听 HTTP 端口 |
+| Task | [定时任务示例](./example/task/main.go) | `log` 等应用配置 | 实现 `Start`、`Stop`，运行 Cron 任务；默认没有入站端口 |
+
+Algorithm、DataRelay、Flow、FlowExtension 示例默认读取 `./etc/config.yaml`，也可用 `--config` 指定配置目录。表中的 gRPC `host/port` 是程序**主动连接**的平台地址，不是程序监听的端口。部署到容器时，应将这些地址改为容器可访问的平台服务地址。
+
+Service、Task 示例读取当前工作目录的 `./etc/config.yaml`，不使用 `--config` 参数。上文从仓库根目录运行这两个示例时会使用 SDK 默认配置；要加载示例里的配置，请进入各自的 `example/service` 或 `example/task` 目录后执行 `go run .`。Service 的 `server.port` 是实际监听端口；Task 默认不监听端口。
+
+发布到平台时，按目标运行模式准备 `service.yml`、可执行文件或 Docker 镜像，以及运行所需的 `etc/config.yaml`。驱动使用 `GroupName: driver`，数据中继使用 `GroupName: dataRelay`；算法、流程、流程扩展、HTTP 服务和定时任务作为普通服务安装时使用 `GroupName: server`。`Name` 填服务的安装包标识，原生包的 `Command` 指向实际可执行文件。容器包用 `Service: None` 表示没有入站服务；提供 HTTP 等入站接口时用 `Internal` 或 `External`，并填写 `Path` 和 `Ports`。这些字段与原生包的端口字段不同。
+
+例如 HTTP Service 配置 `server.port: 9000` 后，Windows 原生包的 `service.yml` 可写为：
+
+```yaml
+Name: go-http-demo
+Version: 1.0.0
+GroupName: server
+ConfigType: config.yaml
+Command: go-http-demo.exe
+Path: /go-http-demo
+Port: 9000
+```
+
+Linux 容器包使用以下端口写法，并确保镜像内的 `etc/config.yaml` 同样配置 `server.port: 9000`：
+
+```yaml
+Name: go-http-demo
+Version: 1.0.0
+GroupName: server
+Service: Internal
+Path: /go-http-demo
+Ports:
+  - Host: "9000"
+    Container: "9000"
+    Protocol: ""
+    AppProtocol: http
+```
+
+`Internal` 供平台内部访问；需要发布到宿主机时改为 `External`，并在 `Host` 填宿主机端口。Task 及仅主动连接平台、没有入站接口的模块无需 `Path` 和端口字段。下文的构建命令和文件结构以驱动为例，其他模块需替换入口、配置及服务分组；授权动态库说明仅适用于驱动的相应启动路径。
+
+安装顺序按模块区分：
+
+| 模块 | 发布与安装 |
+| --- | --- |
+| Driver | 先通过运维管理的**离线上传驱动**将安装包加入驱动仓库，再在项目中选择该驱动并安装或创建驱动实例。`GroupName` 为 `driver`。 |
+| DataRelay | 先通过**离线上传数据中继服务**将安装包加入数据中继仓库，再为目标项目或实例安装数据中继服务。`GroupName` 为 `dataRelay`。 |
+| Algorithm、Flow、FlowExtension、Service、Task | 按平台的普通服务安装入口部署；作为普通服务安装时，`GroupName` 为 `server`。 |
+
+上传仅把 Driver 或 DataRelay 的安装包放入对应仓库；具体运行实例由后续安装步骤创建。界面名称和位置可能随平台版本变化。
 
 ## Driver 配置示例
 
@@ -408,9 +490,9 @@ curl -fL --retry 3 -o lib/license_core_linux_amd64.so https://d.gtsiot.cn/driver
 
 ### 安装与核验
 
-1. 在运维管理系统的服务管理中选择对应平台的离线上传驱动入口，上传**外层** ZIP 或 `tar.gz` 包；界面位置随平台版本变化。也可按本环境的发布流程将包放入离线仓库后安装。
+1. 在运维管理系统选择**离线上传驱动**，上传**外层** ZIP 或 `tar.gz` 包，先将安装包加入驱动仓库；界面位置随平台版本变化。也可按本环境的发布流程将包放入离线仓库。
 2. 确认 `service.yml` 的 `GroupName: driver`、`Name`、`Version` 和包内文件完整。Linux 容器包的 `service.yml` 必须位于归档根目录；Windows ZIP 同样建议直接放在根目录。
-3. 查看运维服务的安装日志和驱动运行日志，确认镜像导入或进程启动成功，再在项目里创建驱动实例并检查连接、配置下发与数据上报。
+3. 在项目中选择已上传的驱动并安装或创建驱动实例。查看运维安装日志和驱动运行日志，确认镜像导入或进程启动成功，再检查连接、配置下发与数据上报。
 4. 若安装失败，先检查包格式与架构、`service.yml` 的 `Command` 或 `Service`/`Ports`、配置文件路径。使用本地 `dataFile` 或 HTTP 启动路径时，再检查授权动态库是否存在及其依赖是否与运行环境兼容。
 
 ## FAQ
